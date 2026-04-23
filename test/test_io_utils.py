@@ -2,11 +2,18 @@
 
 """Tests for io_utils extensionless video file handling (D99228861)."""
 
+import pickle
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sam3.model.io_utils import load_video_frames
+import torch
+
+from sam3.model.io_utils import (
+    IncrementalVideoFrameLoader,
+    load_video_frames,
+    load_video_frames_from_video_file,
+)
 
 
 class TestLoadVideoFramesRouting(unittest.TestCase):
@@ -106,3 +113,138 @@ class TestLoadVideoFramesRouting(unittest.TestCase):
         )
         mock_load_video.assert_called_once()
         self.assertEqual(result, ("frames", 480, 640))
+
+
+class _FakeVideoReader:
+    """Minimal stand-in for decord.VideoReader used in tests."""
+
+    def __init__(self, num_frames=20, height=32, width=48):
+        self.num_frames = num_frames
+        self.height = height
+        self.width = width
+        self.access_count = {}
+
+    def __len__(self):
+        return self.num_frames
+
+    def __getitem__(self, idx):
+        self.access_count[idx] = self.access_count.get(idx, 0) + 1
+        # Each frame gets a unique constant value so we can detect mis-caching.
+        return torch.full(
+            (self.height, self.width, 3), fill_value=idx, dtype=torch.uint8
+        )
+
+
+class TestIncrementalVideoFrameLoader(unittest.TestCase):
+    """Tests for the decord-backed incremental frame loader."""
+
+    @patch("sam3.model.io_utils.IncrementalVideoFrameLoader")
+    def test_decord_backend_routes_to_incremental_loader(self, mock_loader_cls):
+        """video_loader_type='decord' should instantiate IncrementalVideoFrameLoader."""
+        instance = MagicMock()
+        instance.video_height = 480
+        instance.video_width = 640
+        mock_loader_cls.return_value = instance
+        frames, h, w = load_video_frames_from_video_file(
+            video_path="/tmp/test_video.mp4",
+            image_size=256,
+            offload_video_to_cpu=True,
+            img_mean=(0.5, 0.5, 0.5),
+            img_std=(0.5, 0.5, 0.5),
+            async_loading_frames=False,
+            video_loader_type="decord",
+        )
+        mock_loader_cls.assert_called_once()
+        self.assertIs(frames, instance)
+        self.assertEqual((h, w), (480, 640))
+
+    def test_invalid_loader_type_raises(self):
+        """Unknown video_loader_type values should raise a helpful error."""
+        with self.assertRaises(RuntimeError) as ctx:
+            load_video_frames_from_video_file(
+                video_path="/tmp/test.mp4",
+                image_size=256,
+                offload_video_to_cpu=True,
+                img_mean=(0.5, 0.5, 0.5),
+                img_std=(0.5, 0.5, 0.5),
+                async_loading_frames=False,
+                video_loader_type="nope",
+            )
+        self.assertIn("decord", str(ctx.exception))
+
+    def _make_loader(self, num_frames=20, cache_size=4):
+        fake_reader = _FakeVideoReader(num_frames=num_frames)
+        with patch.object(
+            IncrementalVideoFrameLoader, "_open_reader", return_value=fake_reader
+        ):
+            loader = IncrementalVideoFrameLoader(
+                video_path="<fake>",
+                image_size=16,
+                offload_video_to_cpu=True,
+                img_mean=(0.5, 0.5, 0.5),
+                img_std=(0.5, 0.5, 0.5),
+                cache_size=cache_size,
+            )
+        return loader, fake_reader
+
+    def test_basic_metadata(self):
+        loader, _ = self._make_loader(num_frames=10)
+        self.assertEqual(len(loader), 10)
+        self.assertEqual(loader.video_height, 32)
+        self.assertEqual(loader.video_width, 48)
+
+    def test_getitem_returns_preprocessed_tensor(self):
+        loader, _ = self._make_loader()
+        frame = loader[0]
+        self.assertEqual(frame.shape, (3, 16, 16))
+        self.assertEqual(frame.dtype, torch.float16)
+
+    def test_lru_cache_bounds_memory(self):
+        loader, _ = self._make_loader(num_frames=20, cache_size=4)
+        for i in range(20):
+            _ = loader[i]
+            self.assertLessEqual(len(loader._cache), 4)
+        self.assertEqual(len(loader._cache), 4)
+        # The most recent 4 frames should be resident.
+        self.assertEqual(list(loader._cache.keys()), [16, 17, 18, 19])
+
+    def test_repeated_access_hits_cache(self):
+        loader, fake = self._make_loader(num_frames=10, cache_size=4)
+        _ = loader[5]
+        _ = loader[5]
+        _ = loader[5]
+        # Warmup opens the reader by reading frame 0 once for metadata.
+        self.assertEqual(fake.access_count.get(5, 0), 1)
+
+    def test_out_of_range_raises(self):
+        loader, _ = self._make_loader(num_frames=5)
+        with self.assertRaises(IndexError):
+            _ = loader[10]
+
+    def test_negative_index_supported(self):
+        loader, _ = self._make_loader(num_frames=5)
+        last = loader[-1]
+        explicit = loader[4]
+        self.assertTrue(torch.equal(last, explicit))
+
+    def test_getstate_drops_reader_and_cache(self):
+        loader, _ = self._make_loader(num_frames=5, cache_size=4)
+        _ = loader[0]
+        self.assertGreater(len(loader._cache), 0)
+        state = loader.__getstate__()
+        self.assertIsNone(state["_reader"])
+        self.assertEqual(len(state["_cache"]), 0)
+
+    def test_roundtrip_pickle_rebuilds_reader(self):
+        loader, _ = self._make_loader(num_frames=5, cache_size=4)
+        _ = loader[0]
+        blob = pickle.dumps(loader)
+        restored = pickle.loads(blob)
+        self.assertIsNone(restored._reader)
+        # Accessing a frame should lazily reopen via _open_reader.
+        fake = _FakeVideoReader(num_frames=5)
+        with patch.object(
+            IncrementalVideoFrameLoader, "_open_reader", return_value=fake
+        ):
+            frame = restored[2]
+        self.assertEqual(frame.shape, (3, 16, 16))

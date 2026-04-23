@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import time
+from collections import OrderedDict
 from threading import Condition, get_ident, Lock, Thread
 
 import numpy as np
@@ -271,8 +272,20 @@ def load_video_frames_from_video_file(
             if async_thread is not None:
                 async_thread.join()
         return lazy_images, lazy_images.video_height, lazy_images.video_width
+    elif video_loader_type == "decord":
+        logger.info("Using decord to load video file incrementally")
+        lazy_images = IncrementalVideoFrameLoader(
+            video_path=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+        )
+        return lazy_images, lazy_images.video_height, lazy_images.video_width
     else:
-        raise RuntimeError("video_loader_type must be either 'cv2' or 'torchcodec'")
+        raise RuntimeError(
+            "video_loader_type must be one of 'cv2', 'torchcodec', or 'decord'"
+        )
 
 
 def load_video_frames_from_video_file_using_cv2(
@@ -739,3 +752,131 @@ class AsyncVideoFileLoaderWithTorchCodec:
         self.rand_seek_idx_queue = None
         self.torchcodec_access_lock = contextlib.nullcontext()
         return self.__dict__.copy()
+
+
+class IncrementalVideoFrameLoader:
+    """
+    Lazily decode video frames with a bounded LRU cache.
+
+    Unlike the eager cv2/torchcodec paths that materialize all T frames into a
+    single (T, 3, H, H) float16 tensor, this loader keeps at most `cache_size`
+    preprocessed frames resident at once. Peak memory is therefore O(cache_size)
+    regardless of video length, which is what makes long videos tractable.
+
+    decord.VideoReader supports fast random seek, so arbitrary __getitem__
+    access is cheap; the trade-off is per-frame decode latency on cache miss.
+    """
+
+    DEFAULT_CACHE_SIZE = 128
+
+    def __init__(
+        self,
+        video_path,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        cache_size=None,
+    ):
+        self.video_path = video_path
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        if not isinstance(img_mean, torch.Tensor):
+            img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+        if not isinstance(img_std, torch.Tensor):
+            img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+        self.out_device = (
+            torch.device("cpu") if offload_video_to_cpu else torch.device("cuda")
+        )
+        self.img_mean = img_mean.to(self.out_device)
+        self.img_std = img_std.to(self.out_device)
+
+        self._reader_lock = Lock()
+        self._reader = self._open_reader()
+        self.num_frames = len(self._reader)
+        shape = self._reader[0].shape  # (H, W, 3) uint8
+        self.video_height = int(shape[0])
+        self.video_width = int(shape[1])
+
+        if cache_size is None:
+            cache_size = max(32, min(self.num_frames, self.DEFAULT_CACHE_SIZE))
+        self.cache_size = max(1, cache_size)
+        self._cache = OrderedDict()
+        self._cache_lock = Lock()
+
+    def _open_reader(self):
+        import decord
+
+        decord.bridge.set_bridge("torch")
+        return decord.VideoReader(self.video_path)
+
+    def _ensure_reader(self):
+        if self._reader is None:
+            with self._reader_lock:
+                if self._reader is None:
+                    self._reader = self._open_reader()
+        return self._reader
+
+    def _transform_frame(self, frame_hwc_uint8):
+        # decord returns (H, W, 3) uint8; convert to (3, H, W) float16 on out_device
+        frame = frame_hwc_uint8.to(self.out_device, non_blocking=True)
+        frame = frame.permute(2, 0, 1).float()
+        frame = F.interpolate(
+            frame[None, :],
+            size=(self.image_size, self.image_size),
+            mode="bicubic",
+            align_corners=False,
+        )[0]
+        frame = frame.half()
+        frame /= 255
+        frame -= self.img_mean
+        frame /= self.img_std
+        return frame
+
+    @torch.inference_mode()
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.num_frames
+        if index < 0 or index >= self.num_frames:
+            raise IndexError(
+                f"Index {index} out of range for video with {self.num_frames} frames"
+            )
+
+        with self._cache_lock:
+            cached = self._cache.get(index)
+            if cached is not None:
+                self._cache.move_to_end(index)
+                return cached
+
+        reader = self._ensure_reader()
+        with self._reader_lock:
+            raw = reader[index]
+
+        processed = self._transform_frame(raw)
+
+        with self._cache_lock:
+            self._cache[index] = processed
+            self._cache.move_to_end(index)
+            while len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+        return processed
+
+    def __len__(self):
+        return self.num_frames
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # VideoReader, locks, and cached GPU tensors are not picklable / should
+        # be rebuilt in the new process.
+        state["_reader"] = None
+        state["_reader_lock"] = None
+        state["_cache"] = OrderedDict()
+        state["_cache_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._reader_lock = Lock()
+        self._cache_lock = Lock()
+        self._cache = OrderedDict()
+        self._reader = None
